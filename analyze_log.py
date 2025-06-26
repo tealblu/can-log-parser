@@ -1,6 +1,6 @@
 import re
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 @dataclass
 class CANMessage:
@@ -14,9 +14,14 @@ class CANMessage:
     direction: str
     raw_line: str
     line_number: int
+    
+    @property
+    def data_signature(self) -> str:
+        """Return a string representation of the data bytes for comparison"""
+        return ' '.join(self.data_bytes)
 
-class CANLogParser:
-    """Parser for CAN log files in the specified format"""
+class CANDataParser:
+    """Parser for CAN log files focusing on unique data patterns"""
     
     def __init__(self):
         self.messages: List[CANMessage] = []
@@ -128,140 +133,155 @@ class CANLogParser:
         """Return all parsed messages"""
         return self.messages
     
-    def filter_by_first_appearance_after(self, min_timestamp: float) -> List[CANMessage]:
+    def filter_by_unique_data_after(self, min_timestamp: float) -> List[CANMessage]:
         """
-        Filter messages to only include CAN IDs that first appeared after the specified timestamp.
-        This removes any CAN ID that had its first occurrence before min_timestamp.
+        Filter messages to only include data patterns that first appeared after the specified timestamp.
+        This removes any data pattern that had its first occurrence before min_timestamp.
         
         Args:
-            min_timestamp: Only include CAN IDs that first appeared after this time
+            min_timestamp: Only include data patterns that first appeared after this time
             
         Returns:
-            List of CANMessage objects with filtered CAN IDs
+            List of CANMessage objects with filtered data patterns
         """
         if not self.messages:
             return []
         
-        # Find the first occurrence timestamp for each CAN ID
+        # Find the first occurrence timestamp for each unique data pattern
         first_occurrence = {}
         for msg in self.messages:
-            if msg.can_id not in first_occurrence:
-                first_occurrence[msg.can_id] = msg.timestamp
+            data_pattern = msg.data_signature
+            if data_pattern not in first_occurrence:
+                first_occurrence[data_pattern] = msg.timestamp
         
-        # Determine which CAN IDs first appeared after the threshold
-        valid_can_ids = {
-            can_id for can_id, first_time in first_occurrence.items() 
+        # Determine which data patterns first appeared after the threshold
+        valid_data_patterns = {
+            pattern for pattern, first_time in first_occurrence.items() 
             if first_time >= min_timestamp
         }
         
-        # Filter messages to only include valid CAN IDs
+        # Filter messages to only include valid data patterns
         filtered_messages = [
             msg for msg in self.messages 
-            if msg.can_id in valid_can_ids
+            if msg.data_signature in valid_data_patterns
         ]
         
-        print(f"Filtering by first appearance after {min_timestamp:.6f}s:")
-        print(f"  Total CAN IDs: {len(first_occurrence)}")
-        print(f"  CAN IDs appearing after threshold: {len(valid_can_ids)}")
+        print(f"Filtering by unique data first appearance after {min_timestamp:.6f}s:")
+        print(f"  Total unique data patterns: {len(first_occurrence)}")
+        print(f"  Data patterns appearing after threshold: {len(valid_data_patterns)}")
         print(f"  Messages before filtering: {len(self.messages)}")
         print(f"  Messages after filtering: {len(filtered_messages)}")
         
-        if valid_can_ids:
-            print(f"  Valid CAN IDs: {sorted(valid_can_ids)}")
+        if valid_data_patterns:
+            print(f"  Sample valid data patterns:")
+            for i, pattern in enumerate(sorted(valid_data_patterns)[:5]):
+                print(f"    {i+1}: [{pattern}]")
+            if len(valid_data_patterns) > 5:
+                print(f"    ... and {len(valid_data_patterns) - 5} more")
         
         return filtered_messages
     
-    def dump_can_ids(self, sort_by: str = 'id') -> None:
+    def dump_data_patterns(self, sort_by: str = 'first_time') -> None:
         """
-        Dump all CAN IDs found in the log with statistics
+        Dump all unique data patterns found in the log with statistics
         
         Args:
-            sort_by: How to sort the output - 'id', 'count', 'first_time', or 'last_time'
+            sort_by: How to sort the output - 'pattern', 'count', 'first_time', or 'last_time'
         """
         if not self.messages:
             print("No messages to analyze.")
             return
         
-        # Collect statistics for each CAN ID
-        can_id_stats = {}
+        # Collect statistics for each data pattern
+        pattern_stats = {}
         
         for msg in self.messages:
-            if msg.can_id not in can_id_stats:
-                can_id_stats[msg.can_id] = {
+            pattern = msg.data_signature
+            if pattern not in pattern_stats:
+                pattern_stats[pattern] = {
                     'count': 0,
                     'first_time': msg.timestamp,
                     'last_time': msg.timestamp,
-                    'data_lengths': set()
+                    'can_ids': set(),
+                    'first_msg': msg
                 }
             
-            stats = can_id_stats[msg.can_id]
+            stats = pattern_stats[pattern]
             stats['count'] += 1
             stats['first_time'] = min(stats['first_time'], msg.timestamp)
             stats['last_time'] = max(stats['last_time'], msg.timestamp)
-            stats['data_lengths'].add(msg.data_length)
+            stats['can_ids'].add(msg.can_id)
         
         # Sort based on the specified criteria
         if sort_by == 'count':
-            sorted_ids = sorted(can_id_stats.items(), key=lambda x: x[1]['count'], reverse=True)
-        elif sort_by == 'first_time':
-            sorted_ids = sorted(can_id_stats.items(), key=lambda x: x[1]['first_time'])
+            sorted_patterns = sorted(pattern_stats.items(), key=lambda x: x[1]['count'], reverse=True)
+        elif sort_by == 'pattern':
+            sorted_patterns = sorted(pattern_stats.items())
         elif sort_by == 'last_time':
-            sorted_ids = sorted(can_id_stats.items(), key=lambda x: x[1]['last_time'])
-        else:  # sort by 'id' (default)
-            sorted_ids = sorted(can_id_stats.items())
+            sorted_patterns = sorted(pattern_stats.items(), key=lambda x: x[1]['last_time'])
+        else:  # sort by 'first_time' (default)
+            sorted_patterns = sorted(pattern_stats.items(), key=lambda x: x[1]['first_time'])
         
-        print(f"\n=== CAN ID Analysis (sorted by {sort_by}) ===")
-        print(f"{'CAN ID':<12} {'Count':<8} {'First Time':<12} {'Last Time':<12} {'Duration':<10} {'Data Len'}")
-        print("-" * 80)
+        print(f"\n=== Data Pattern Analysis (sorted by {sort_by}) ===")
+        print(f"{'Data Pattern':<30} {'Count':<8} {'First Time':<12} {'Last Time':<12} {'Duration':<10} {'CAN IDs'}")
+        print("-" * 100)
         
-        for can_id, stats in sorted_ids:
+        for pattern, stats in sorted_patterns:
             duration = stats['last_time'] - stats['first_time']
-            data_lens = ','.join(map(str, sorted(stats['data_lengths'])))
+            can_ids_str = ','.join(sorted(stats['can_ids']))[:20]  # Limit display length
+            if len(can_ids_str) >= 20:
+                can_ids_str += "..."
             
-            print(f"{can_id:<12} {stats['count']:<8} "
+            # Truncate pattern if too long
+            display_pattern = pattern[:28] + ".." if len(pattern) > 30 else pattern
+            
+            print(f"{display_pattern:<30} {stats['count']:<8} "
                   f"{stats['first_time']:<12.6f} {stats['last_time']:<12.6f} "
-                  f"{duration:<10.3f} {data_lens}")
+                  f"{duration:<10.3f} {can_ids_str}")
         
-        print(f"\nTotal unique CAN IDs: {len(can_id_stats)}")
-        print(f"Total messages: {sum(stats['count'] for stats in can_id_stats.values())}")
+        print(f"\nTotal unique data patterns: {len(pattern_stats)}")
+        print(f"Total messages: {sum(stats['count'] for stats in pattern_stats.values())}")
     
-    def get_can_ids_list(self) -> List[str]:
+    def get_unique_data_patterns(self) -> List[str]:
         """
-        Return a simple list of all unique CAN IDs found in the log
+        Return a simple list of all unique data patterns found in the log
         
         Returns:
-            List of unique CAN ID strings
+            List of unique data pattern strings
         """
-        return list(set(msg.can_id for msg in self.messages))
+        return list(set(msg.data_signature for msg in self.messages))
     
-    def print_can_id_data(self, target_can_id: str, max_messages: int = None, show_hex: bool = True) -> None:
+    def print_data_pattern_messages(self, target_pattern: str, max_messages: int = None, show_hex: bool = True) -> None:
         """
-        Print all data for a specified CAN ID
+        Print all messages with a specified data pattern
         
         Args:
-            target_can_id: The CAN ID to search for (case-sensitive)
+            target_pattern: The data pattern to search for (space-separated hex values)
             max_messages: Maximum number of messages to display (None = all)
             show_hex: Whether to show data in hex format (True) or decimal (False)
         """
-        # Filter messages for the specified CAN ID
-        matching_messages = [msg for msg in self.messages if msg.can_id == target_can_id]
+        # Filter messages for the specified data pattern
+        matching_messages = [msg for msg in self.messages if msg.data_signature == target_pattern]
         
         if not matching_messages:
-            print(f"No messages found for CAN ID: {target_can_id}")
-            available_ids = sorted(self.get_can_ids_list())
-            print(f"Available CAN IDs: {available_ids[:10]}{'...' if len(available_ids) > 10 else ''}")
+            print(f"No messages found for data pattern: [{target_pattern}]")
+            available_patterns = sorted(self.get_unique_data_patterns())
+            print(f"Available patterns (first 5): {available_patterns[:5]}")
             return
+        
+        # Show pattern analysis
+        self._analyze_data_pattern(matching_messages, target_pattern)
         
         # Limit messages if specified
         if max_messages and len(matching_messages) > max_messages:
-            print(f"Showing first {max_messages} of {len(matching_messages)} messages for CAN ID: {target_can_id}")
+            print(f"Showing first {max_messages} of {len(matching_messages)} messages for pattern: [{target_pattern}]")
             display_messages = matching_messages[:max_messages]
         else:
-            print(f"All {len(matching_messages)} messages for CAN ID: {target_can_id}")
+            print(f"All {len(matching_messages)} messages for pattern: [{target_pattern}]")
             display_messages = matching_messages
         
-        print(f"{'#':<6} {'Timestamp':<12} {'DL':<3} {'Data Bytes':<30} {'Line#':<6}")
-        print("-" * 65)
+        print(f"{'#':<6} {'CAN ID':<12} {'Timestamp':<12} {'DL':<3} {'Data Bytes':<30} {'Line#':<6}")
+        print("-" * 75)
         
         for i, msg in enumerate(display_messages, 1):
             if show_hex:
@@ -273,23 +293,20 @@ class CANLogParser:
                 except ValueError:
                     data_str = ' '.join(f"{byte:>3}" for byte in msg.data_bytes)  # Fallback if not hex
             
-            print(f"{i:<6} {msg.timestamp:<12.6f} {msg.data_length:<3} {data_str:<30} {msg.line_number:<6}")
-        
-        # Show data analysis
-        self._analyze_can_id_data(matching_messages, target_can_id)
+            print(f"{i:<6} {msg.can_id:<12} {msg.timestamp:<12.6f} {msg.data_length:<3} {data_str:<30} {msg.line_number:<6}")
     
-    def _analyze_can_id_data(self, messages: List[CANMessage], can_id: str) -> None:
+    def _analyze_data_pattern(self, messages: List[CANMessage], pattern: str) -> None:
         """
-        Analyze and display patterns in the data for a specific CAN ID
+        Analyze and display information about messages with a specific data pattern
         
         Args:
-            messages: List of messages for a specific CAN ID
-            can_id: The CAN ID being analyzed
+            messages: List of messages with the same data pattern
+            pattern: The data pattern being analyzed
         """
         if not messages:
             return
         
-        print(f"\n=== Data Analysis for {can_id} ===")
+        print(f"\n=== Pattern Analysis for [{pattern}] ===")
         
         # Time analysis
         first_msg = messages[0]
@@ -309,45 +326,58 @@ class CANLogParser:
             print(f"Timing: {total_duration:.3f}s total, avg interval: {avg_interval:.6f}s, "
                   f"range: {min_interval:.6f}s - {max_interval:.6f}s")
         
-        # Data byte analysis
-        data_lengths = set(msg.data_length for msg in messages)
-        print(f"Data lengths used: {sorted(data_lengths)}")
+        # CAN ID analysis
+        can_ids = set(msg.can_id for msg in messages)
+        print(f"Used by {len(can_ids)} different CAN ID(s): {sorted(can_ids)}")
         
-        # Analyze each byte position for patterns
-        if messages[0].data_length > 0:
-            print("\nByte position analysis:")
-            for byte_pos in range(max(msg.data_length for msg in messages)):
-                byte_values = []
-                for msg in messages:
-                    if byte_pos < len(msg.data_bytes):
-                        try:
-                            byte_values.append(int(msg.data_bytes[byte_pos], 16))
-                        except ValueError:
-                            pass  # Skip non-hex values
-                
-                if byte_values:
-                    unique_values = set(byte_values)
-                    if len(unique_values) == 1:
-                        print(f"  Byte {byte_pos}: Constant = 0x{byte_values[0]:02X} ({byte_values[0]})")
-                    elif len(unique_values) <= 5:
-                        hex_vals = [f"0x{v:02X}" for v in sorted(unique_values)]
-                        print(f"  Byte {byte_pos}: {len(unique_values)} values = {', '.join(hex_vals)}")
-                    else:
-                        print(f"  Byte {byte_pos}: {len(unique_values)} different values, "
-                              f"range: 0x{min(byte_values):02X}-0x{max(byte_values):02X} "
-                              f"({min(byte_values)}-{max(byte_values)})")
+        # Channel analysis
+        channels = set(msg.channel for msg in messages)
+        print(f"Seen on channel(s): {sorted(channels)}")
     
-    def get_messages_by_can_id(self, target_can_id: str) -> List[CANMessage]:
+    def get_messages_by_data_pattern(self, target_pattern: str) -> List[CANMessage]:
         """
-        Get all messages for a specified CAN ID
+        Get all messages with a specified data pattern
         
         Args:
-            target_can_id: The CAN ID to search for
+            target_pattern: The data pattern to search for
             
         Returns:
-            List of CANMessage objects matching the CAN ID
+            List of CANMessage objects matching the data pattern
         """
-        return [msg for msg in self.messages if msg.can_id == target_can_id]
+        return [msg for msg in self.messages if msg.data_signature == target_pattern]
+    
+    def find_similar_patterns(self, reference_pattern: str, max_differences: int = 1) -> List[Tuple[str, int]]:
+        """
+        Find data patterns similar to a reference pattern
+        
+        Args:
+            reference_pattern: The pattern to compare against
+            max_differences: Maximum number of differing bytes to consider similar
+            
+        Returns:
+            List of tuples (pattern, difference_count) sorted by similarity
+        """
+        ref_bytes = reference_pattern.split()
+        similar_patterns = []
+        
+        for msg in self.messages:
+            msg_bytes = msg.data_bytes
+            
+            # Only compare patterns of the same length
+            if len(msg_bytes) != len(ref_bytes):
+                continue
+                
+            # Count differences
+            differences = sum(1 for a, b in zip(ref_bytes, msg_bytes) if a != b)
+            
+            if 0 < differences <= max_differences:
+                pattern = msg.data_signature
+                if pattern not in [p[0] for p in similar_patterns]:
+                    similar_patterns.append((pattern, differences))
+        
+        # Sort by number of differences
+        similar_patterns.sort(key=lambda x: x[1])
+        return similar_patterns
     
     def print_summary(self) -> None:
         """Print a summary of the parsed data"""
@@ -358,6 +388,10 @@ class CANLogParser:
         print(f"\n=== CAN Log Summary ===")
         print(f"Total messages: {len(self.messages)}")
         print(f"Time range: {self.messages[0].timestamp:.6f} - {self.messages[-1].timestamp:.6f}")
+        
+        # Count unique data patterns
+        unique_patterns = set(msg.data_signature for msg in self.messages)
+        print(f"Unique data patterns: {len(unique_patterns)}")
         
         # Count unique CAN IDs
         unique_ids = set(msg.can_id for msg in self.messages)
@@ -382,7 +416,7 @@ class CANLogParser:
 
 if __name__ == "__main__":
     # Create parser instance
-    parser = CANLogParser()
+    parser = CANDataParser()
     
     # Parse a file (replace 'your_log_file.log' with actual filename)
     log_filename = "jaltest parameter and soot reset kvaser log 650k 2.txt"
@@ -394,19 +428,11 @@ if __name__ == "__main__":
     # Example: Access the in-memory database
     messages = parser.get_messages()
     
-    # You can now add filtering code here, for example:
-    # - Filter by CAN ID: [msg for msg in messages if msg.can_id == '18EF8D1E']
-    # - Filter by timestamp range: [msg for msg in messages if 0.01 <= msg.timestamp <= 0.02]
-    # - Filter by data content: [msg for msg in messages if msg.data_bytes[0] == 'FF']
+    # Filter by unique data patterns appearing after timestamp
+    filtered_messages = parser.filter_by_unique_data_after(180.0)
     
-    print(f"\nReady for filtering! Database contains {len(messages)} messages.")
-
-    filtered_messages = parser.filter_by_first_appearance_after(180.0)
-    parser.messages = filtered_messages
-    parser.print_summary()
-
-    can_ids = parser.get_can_ids_list()
-    print(f"Unique CAN IDs: {can_ids}")
-
-    for can_id in can_ids:
-        parser.print_can_id_data(can_id)
+    # Show data pattern statistics
+    parser.dump_data_patterns(sort_by='first_time')
+    
+    print(f"\nReady for data pattern analysis! Database contains {len(messages)} messages.")
+    print(f"Found {len(filtered_messages)} messages with data patterns first appearing after 180.0s")
