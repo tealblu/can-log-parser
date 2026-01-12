@@ -1,6 +1,51 @@
 import re
+import statistics
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict, Set, Any
+
+# ============================================================================
+# CONFIGURATION - Edit these settings to customize command detection
+# ============================================================================
+CONFIG = {
+    # Command/Test identification
+    'command_name': 'Cylinder Cutout Routine End',  # Name of the command being searched for
+    'description': 'CAN message pattern detection for cylinder cutout routine end',
+    
+    # Log file paths
+    'log_directory': 'logs',
+    'log_filename': 'insite kvaser log.txt',
+    'full_log_path': lambda: f"{CONFIG['log_directory']}/{CONFIG['log_filename']}",
+    
+    # Command timing (seconds relative to log start)
+    'command_fire_times': [218, 222, 317],
+    'log_start_time': 0.0,
+    'routine_start_time': 227,  # Optional; leave None if not needed
+    
+    # Detection algorithm parameters
+    'search_radius': 0.75,      # ± seconds around each fire time to search
+    'min_coverage': 0.5,        # Minimum fraction of fire_times that must match (0.0-1.0)
+    'max_candidates': 15,       # Maximum number of results to return
+    
+    # Output formatting
+    'print_log_summary': True,  # Print CAN log statistics before detection
+    'print_verbose': True,      # Print detailed output
+    'timestamp_precision': 6,   # Decimal places for timestamp display
+    'pattern_display_width': 30,  # Max width for displaying data pattern
+    'confidence_precision': 3,  # Decimal places for confidence scores
+    'delta_precision': 3,       # Decimal places for timing deltas
+    'table_column_widths': {
+        'rank': 5,
+        'can_id': 12,
+        'pattern': 30,
+        'coverage': 10,
+        'median_delta': 10,
+        'avg_delta': 10,
+        'max_delta': 10,
+        'confidence': 12,
+    },
+}
+# ============================================================================
+
 
 @dataclass
 class CANMessage:
@@ -20,11 +65,31 @@ class CANMessage:
         """Return a string representation of the data bytes for comparison"""
         return ' '.join(self.data_bytes)
 
+
+@dataclass
+class CandidateCommandMatch:
+    """Represents a candidate command matched by aligning to fire times"""
+    can_id: str
+    data_signature: str
+    data_length: int
+    sample_timestamp: float
+    sample_line: int
+    coverage: float
+    median_abs_delta: float
+    avg_abs_delta: float
+    max_abs_delta: float
+    confidence: float
+
+
 class CANDataPatternAnalyzer:
     """Core analyzer for CAN data patterns"""
     
     def __init__(self, messages: List[CANMessage]):
         self.messages = messages
+        # Pre-index messages by pattern for fast lookup
+        self._messages_by_pattern: Dict[str, List[CANMessage]] = {}
+        for msg in messages:
+            self._messages_by_pattern.setdefault(msg.data_signature, []).append(msg)
     
     def filter_by_unique_data_after(self, min_timestamp: float) -> List[CANMessage]:
         """Filter messages to only include data patterns first appearing after min_timestamp"""
@@ -240,6 +305,129 @@ class CANDataPatternAnalyzer:
         
         similar_patterns.sort(key=lambda x: x[1])
         return similar_patterns
+    
+    def find_command_candidates(
+        self,
+        fire_times: List[float],
+        search_radius: float = 0.75,
+        min_coverage: float = 0.5,
+        max_candidates: int = 15,
+    ) -> List[CandidateCommandMatch]:
+        """
+        Find candidate command messages by aligning data patterns to fire times.
+        Only considers patterns where ALL occurrences fall within search windows.
+        
+        Args:
+            fire_times: Command fire times in seconds (relative to log start).
+            search_radius: Allowable time window (± seconds) around each fire time.
+            min_coverage: Minimum fraction of fire_times that must match (0.0-1.0).
+            max_candidates: Maximum number of candidates to return.
+        
+        Returns:
+            List of CandidateCommandMatch sorted by confidence (descending).
+        """
+        if not fire_times or not self.messages:
+            return []
+        
+        target_times = sorted(fire_times)
+        # Build fire time windows: all timestamps that are within search_radius of a fire time
+        fire_time_windows = set()
+        for ft in target_times:
+            for msg in self.messages:
+                if abs(msg.timestamp - ft) <= search_radius:
+                    fire_time_windows.add(msg.timestamp)
+        
+        candidates: List[CandidateCommandMatch] = []
+        
+        for pattern, msgs in self._messages_by_pattern.items():
+            msgs_sorted = sorted(msgs, key=lambda m: m.timestamp)
+            can_ids = {m.can_id for m in msgs_sorted}
+            # Pick most frequent CAN ID for this pattern
+            can_id = max(can_ids, key=lambda cid: sum(1 for m in msgs_sorted if m.can_id == cid))
+            
+            # REJECTION CRITERION: Check if ALL occurrences of this pattern are within fire time windows
+            all_in_window = all(msg.timestamp in fire_time_windows for msg in msgs_sorted)
+            if not all_in_window:
+                continue
+            
+            # Precompute timestamps for efficient nearest-neighbor lookup
+            ts = [m.timestamp for m in msgs_sorted]
+            
+            # Find matches: for each fire time, find nearest message within radius
+            match_deltas: List[float] = []
+            matched_timestamps: List[float] = []
+            for ft in target_times:
+                nearest_delta = self._nearest_delta(ts, ft)
+                if nearest_delta is None or abs(nearest_delta) > search_radius:
+                    continue
+                match_deltas.append(nearest_delta)
+                # Find the actual timestamp of the matched message
+                nearest_ts = ft + nearest_delta
+                matched_timestamps.append(nearest_ts)
+            
+            coverage = len(match_deltas) / len(target_times) if target_times else 0.0
+            if coverage < min_coverage:
+                continue
+            
+            # Compute timing statistics
+            abs_deltas = [abs(d) for d in match_deltas]
+            median_abs = statistics.median(abs_deltas) if abs_deltas else float('inf')
+            avg_abs = statistics.mean(abs_deltas) if abs_deltas else float('inf')
+            max_abs = max(abs_deltas) if abs_deltas else float('inf')
+            
+            # Confidence: blend coverage and timing tightness
+            tightness = 1.0 / (1.0 + median_abs) if median_abs != float('inf') else 0.0
+            confidence = 0.7 * coverage + 0.3 * tightness
+            
+            # Use first matched timestamp instead of first message in log
+            sample_timestamp = matched_timestamps[0] if matched_timestamps else msgs_sorted[0].timestamp
+            sample_line = next((m.line_number for m in msgs_sorted if abs(m.timestamp - sample_timestamp) < 0.001), msgs_sorted[0].line_number)
+            
+            candidates.append(
+                CandidateCommandMatch(
+                    can_id=can_id,
+                    data_signature=pattern,
+                    data_length=msgs_sorted[0].data_length,
+                    sample_timestamp=sample_timestamp,
+                    sample_line=sample_line,
+                    coverage=coverage,
+                    median_abs_delta=median_abs,
+                    avg_abs_delta=avg_abs,
+                    max_abs_delta=max_abs,
+                    confidence=confidence,
+                )
+            )
+        
+        candidates.sort(key=lambda c: c.confidence, reverse=True)
+        return candidates[:max_candidates]
+    
+    @staticmethod
+    def _nearest_delta(sorted_ts: List[float], target: float) -> Optional[float]:
+        """
+        Find the signed delta from target to nearest timestamp in sorted list.
+        Uses binary search for efficiency.
+        """
+        if not sorted_ts:
+            return None
+        
+        # Binary search for insertion point
+        lo, hi = 0, len(sorted_ts) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if sorted_ts[mid] < target:
+                lo = mid + 1
+            else:
+                hi = mid
+        
+        # Check both floor and ceiling candidates
+        candidates = []
+        if lo < len(sorted_ts):
+            candidates.append(sorted_ts[lo])
+        if lo > 0:
+            candidates.append(sorted_ts[lo - 1])
+        
+        nearest = min(candidates, key=lambda x: abs(x - target))
+        return nearest - target
 
 class CANLogParser:
     """Parser for Kvaser CAN log files"""
@@ -362,29 +550,83 @@ class CANLogParser:
             data_str = ' '.join(msg.data_bytes)
             print(f"  {i+1}: CH{msg.channel} {msg.can_id} DL:{msg.data_length} [{data_str}] @ {msg.timestamp:.6f}")
 
-def main():
-    """Example usage of the CAN log analysis tool"""
-    # Create parser instance
+def print_command_candidates(results: List[CandidateCommandMatch], config: Dict = None) -> None:
+    """Pretty-print candidate command matches using configuration settings."""
+    if config is None:
+        config = CONFIG
+    
+    if not results:
+        print(f"No candidate {config['command_name']} patterns matched the provided fire times.")
+        return
+    
+    p = config['pattern_display_width']
+    d = config['delta_precision']
+    c = config['confidence_precision']
+    w = config['table_column_widths']
+    
+    print(f"\n=== Candidate {config['command_name']} Commands ===")
+    print(f"{'Rank':<{w['rank']}} {'CAN ID':<{w['can_id']}} {'Data Pattern':<{w['pattern']}} "
+          f"{'Coverage':<{w['coverage']}} {'Med |Δ|':<{w['median_delta']}} {'Avg |Δ|':<{w['avg_delta']}} "
+          f"{'Max |Δ|':<{w['max_delta']}} {'Confidence':<{w['confidence']}}")
+    print("-" * (sum(w.values()) + 8))
+    
+    for idx, result in enumerate(results, 1):
+        med_str = f"{result.median_abs_delta:.{d}f}s" if result.median_abs_delta != float('inf') else "N/A"
+        avg_str = f"{result.avg_abs_delta:.{d}f}s" if result.avg_abs_delta != float('inf') else "N/A"
+        max_str = f"{result.max_abs_delta:.{d}f}s" if result.max_abs_delta != float('inf') else "N/A"
+        pattern_str = result.data_signature[:p-2] + ".." if len(result.data_signature) > p else result.data_signature
+        
+        print(
+            f"{idx:<{w['rank']}} {result.can_id:<{w['can_id']}} {pattern_str:<{w['pattern']}} "
+            f"{result.coverage:<{w['coverage']}.2f} {med_str:<{w['median_delta']}} {avg_str:<{w['avg_delta']}} "
+            f"{max_str:<{w['max_delta']}} {result.confidence:<{w['confidence']}.{c}f}"
+        )
+        ts_fmt = f"{config['timestamp_precision']}"
+        print(f"       └─ Sample: ts={result.sample_timestamp:.{ts_fmt}f}, line={result.sample_line}, data_length={result.data_length}")
+
+
+def find_command_from_config(config: Dict = None) -> List[CandidateCommandMatch]:
+    """Convenience function to run command detection using CONFIG settings."""
+    if config is None:
+        config = CONFIG
+    
     parser = CANLogParser()
+    log_path = config['full_log_path']() if callable(config.get('full_log_path')) else config.get('full_log_path')
+    parser.parse_file(log_path)
     
-    # Parse a file
-    log_filename = "jaltest parameter and soot reset kvaser log 650k 2.txt"
-    parser.parse_file("logs/" + log_filename)
+    if config['print_log_summary']:
+        parser.print_summary()
     
-    # Print summary
-    parser.print_summary()
-    
-    # Create analyzer for pattern analysis
     analyzer = parser.create_analyzer()
     
-    # Filter by unique data patterns appearing after timestamp
-    filtered_messages = analyzer.filter_by_unique_data_after(180.0)
+    if config['print_verbose']:
+        print(f"\nSearching for {config['command_name']} command...")
+        print(f"Fire times: {config['command_fire_times']}")
+        print(f"Search radius: ±{config['search_radius']}s, Min coverage: {config['min_coverage']:.0%}")
     
-    # Show data pattern statistics
-    analyzer.dump_data_patterns(sort_by='first_time')
+    candidates = analyzer.find_command_candidates(
+        fire_times=config['command_fire_times'],
+        search_radius=config['search_radius'],
+        min_coverage=config['min_coverage'],
+        max_candidates=config['max_candidates'],
+    )
     
-    print(f"\nReady for data pattern analysis! Database contains {parser.get_message_count()} messages.")
-    print(f"Found {len(filtered_messages)} messages with data patterns first appearing after 180.0s")
+    return candidates
+
+
+def main():
+    """Main entry point - uses CONFIG settings for command detection."""
+    candidates = find_command_from_config(CONFIG)
+    print_command_candidates(candidates, CONFIG)
+    
+    if not candidates:
+        print(f"\nNo candidates found. Consider adjusting CONFIG parameters:")
+        print(f"  - 'search_radius' (currently {CONFIG['search_radius']}s)")
+        print(f"  - 'min_coverage' (currently {CONFIG['min_coverage']:.0%})")
+        print(f"  - 'command_fire_times' (currently {CONFIG['command_fire_times']})")
+    else:
+        print(f"\nTop candidate: {candidates[0].can_id} with confidence {candidates[0].confidence:.3f}")
+        print(f"Data pattern: [{candidates[0].data_signature}]")
 
 if __name__ == "__main__":
     main()
