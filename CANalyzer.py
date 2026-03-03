@@ -67,7 +67,7 @@ CONFIG = {
         'max_delta': 10,
         'offset': 16,           # used by print_offset_candidates
         'confidence': 12,
-        'p_value': 12,          # binomial p-value column (absolute mode)
+        'p_value': 12,          # binomial p-value column (absolute mode), lower is better
     },
 }
 # ============================================================================
