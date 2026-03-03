@@ -264,11 +264,11 @@ class NexiqLogFormat(LogFormat):
 
     """
 
-    # Groups: ts, channel_id, data_hex_str
+    # Groups: ts, direction, channel_id, data_hex_str
     _PATTERN = re.compile(
         r'^(\d+\.\d+)'                      # timestamp float (large decimal, origin unknown)
         r'\s+\(\d+\.\d+\)'                 # (delta) - ignored
-        r'\s+Rx\(\)'                        # only Rx frames carry J1939 messages
+        r'\s+(\w+\(\))'                    # direction token: Rx(), Tx(), etc.
         r'\s+ID\s*=\s*(\d+)'              # connection/device ID
         r'.*?Data:\s+'                      # skip Ret/Sz/Blk fields
         r'((?:[0-9A-Fa-f]{2}\s*)+)'       # hex data bytes
@@ -284,7 +284,7 @@ class NexiqLogFormat(LogFormat):
 
     def skip_line(self, line: str) -> bool:
         # Skip non-data lines cheaply before running the full regex
-        return 'Rx()' not in line
+        return 'Data:' not in line
 
     @staticmethod
     def _decode_can_id(data_bytes: List[int]) -> str:
@@ -305,8 +305,9 @@ class NexiqLogFormat(LogFormat):
     def _extract_fields(self, match: re.Match, raw_line: str, line_num: int) -> Optional[CANMessage]:
         try:
             ts_str = match.group(1)
-            channel = int(match.group(2))
-            hex_str = match.group(3).strip()
+            direction_token = match.group(2)          # e.g. "Rx()" or "Tx()"
+            channel = int(match.group(3))
+            hex_str = match.group(4).strip()
 
             raw_bytes = [int(b, 16) for b in hex_str.split()]
 
@@ -319,6 +320,7 @@ class NexiqLogFormat(LogFormat):
             can_id = self._decode_can_id(raw_bytes)
             payload = raw_bytes[10:18]  # 8-byte J1939 data payload
             data_bytes = [f'{b:02X}' for b in payload]
+            direction = direction_token.rstrip('()')  # "Rx" or "Tx"
 
             return CANMessage(
                 channel=channel,
@@ -327,7 +329,7 @@ class NexiqLogFormat(LogFormat):
                 data_length=len(data_bytes),
                 data_bytes=data_bytes,
                 timestamp=timestamp,
-                direction='Rx',
+                direction=direction,
                 raw_line=raw_line,
                 line_number=line_num,
             )
