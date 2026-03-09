@@ -1,4 +1,5 @@
 import math
+import os
 import re
 import statistics
 from abc import ABC, abstractmethod
@@ -21,6 +22,10 @@ CONFIG = {
     # Log format - swap this to change which format is parsed
     # Use: KvaserLogFormat() or NexiqLogFormat()
     'log_format': None,  # Set to None to auto-detect, or set explicitly
+
+    # Multi-log analysis configuration
+    'multi_log_paths': None,   # List of log file paths or directory to scan
+    'max_cross_log_results': 20,  # Maximum number of ranked matches to display
 
     # ---- Absolute mode -------------------------------------------------------
     # Command fire times - use the same numeric value as the timestamp in your log:
@@ -90,6 +95,36 @@ class CANMessage:
     def data_signature(self) -> str:
         """Return a string representation of the data bytes for comparison."""
         return ' '.join(self.data_bytes)
+
+    def get_j1939_fields(self) -> Optional[Dict[str, Any]]:
+        """Extract J1939 fields from the CAN message. Works for both Nexiq and Kvaser formats."""
+        if len(self.data_bytes) < 8:
+            return None
+        try:
+            payload_bytes = [int(b, 16) for b in self.data_bytes]
+        except ValueError:
+            return None
+        can_id_int = int(self.can_id, 16) if isinstance(self.can_id, str) else self.can_id
+        priority = (can_id_int >> 26) & 0x07
+        pgn = (can_id_int >> 8) & 0x3FFFF
+        source_address = can_id_int & 0xFF
+        
+        destination_address = 0xFF
+        payload = self.data_bytes
+        
+        if self.format_flag == 'J1939':
+            destination_address = payload_bytes[0] if len(payload_bytes) >= 1 else 0xFF
+        else:
+            destination_address = payload_bytes[0] if len(payload_bytes) >= 1 else 0xFF
+        
+        return {
+            'pgn': pgn,
+            'source_address': source_address,
+            'destination_address': destination_address,
+            'priority': priority,
+            'payload': payload,
+            'payload_hex': ' '.join(payload),
+        }
 
 
 @dataclass
@@ -1125,9 +1160,240 @@ def find_offset_command_from_config(config: Dict = None) -> List[OffsetCommandMa
     )
 
 
+# ============================================================================
+# MULTI-LOG ANALYSIS - Cross-log similarity detection
+# ============================================================================
+
+@dataclass
+class PerFileCandidate:
+    """Represents a unique-per-file candidate command."""
+    filename: str
+    can_id: str
+    data_signature: str
+    timestamp: float
+    line_number: int
+    j1939_fields: Optional[Dict[str, Any]]
+    occurrence_count: int
+
+
+@dataclass
+class CrossLogMatch:
+    """Represents a matched command across multiple logs."""
+    pgn: int
+    source_address: int
+    destination_address: int
+    candidates: List[PerFileCandidate]
+    similarity_score: float
+    payload_variance: float
+
+
+def collect_log_files(paths: List[str]) -> List[str]:
+    """Collect all log files from given paths (files or directories)."""
+    log_files = []
+    for path in paths:
+        path = path.strip()
+        if os.path.isfile(path):
+            log_files.append(path)
+        elif os.path.isdir(path):
+            for entry in os.listdir(path):
+                full_path = os.path.join(path, entry)
+                if os.path.isfile(full_path) and entry.lower().endswith(('.log', '.txt')):
+                    log_files.append(full_path)
+    return sorted(log_files)
+
+
+def compute_payload_similarity(payload1: List[str], payload2: List[str]) -> float:
+    """Compute similarity between two 8-byte payloads (0.0 to 1.0)."""
+    if len(payload1) != len(payload2):
+        return 0.0
+    exact_matches = sum(1 for a, b in zip(payload1, payload2) if a == b)
+    exact_ratio = exact_matches / len(payload1)
+    numeric_distances = []
+    for a, b in zip(payload1, payload2):
+        try:
+            val_a, val_b = int(a, 16), int(b, 16)
+            dist = abs(val_a - val_b) / 255.0
+            numeric_distances.append(1.0 - dist)
+        except ValueError:
+            numeric_distances.append(1.0 if a == b else 0.0)
+    numeric_similarity = sum(numeric_distances) / len(numeric_distances) if numeric_distances else 0.0
+    return (exact_ratio * 0.6) + (numeric_similarity * 0.4)
+
+
+def compute_candidate_similarity(candidates: List[PerFileCandidate]) -> Tuple[float, float]:
+    """Compute similarity score and variance for a group of candidates."""
+    if len(candidates) < 2:
+        return 1.0, 0.0
+    payloads = [c.j1939_fields['payload'] for c in candidates if c.j1939_fields and 'payload' in c.j1939_fields]
+    if not payloads:
+        return 0.0, float('inf')
+    similarity_scores = []
+    for i, p1 in enumerate(payloads):
+        for p2 in payloads[i+1:]:
+            similarity_scores.append(compute_payload_similarity(p1, p2))
+    avg_similarity = sum(similarity_scores) / len(similarity_scores) if similarity_scores else 0.0
+    byte_variances = []
+    for byte_idx in range(8):
+        try:
+            byte_values = [int(p[byte_idx], 16) for p in payloads if byte_idx < len(p)]
+            if len(byte_values) > 1:
+                mean = sum(byte_values) / len(byte_values)
+                variance = sum((x - mean) ** 2 for x in byte_values) / len(byte_values)
+                byte_variances.append(variance)
+        except (ValueError, IndexError):
+            pass
+    return avg_similarity, sum(byte_variances)
+
+
+def analyze_multi_log(files: List[str], config: Dict = None) -> Dict[str, Any]:
+    """
+    Analyze multiple log files to find candidate commands that:
+      - Occur exactly once per file (i.e. one confirmed firing per capture)
+      - Appear in at least 2 different files (same PGN / SA / DA)
+      - Have similar-but-not-identical payloads across files
+    """
+    if config is None:
+        config = CONFIG
+
+    # Map from filename -> list of single-occurrence candidates
+    per_file_candidates: List[PerFileCandidate] = []
+    issues: List[Dict[str, Any]] = []
+
+    for filepath in files:
+        filename = os.path.basename(filepath)
+        try:
+            parser = CANLogParser(log_format=config.get('log_format'))
+            parser.parse_file(filepath)
+        except Exception as e:
+            issues.append({'file': filename, 'type': 'error', 'message': f'Parse error: {str(e)}'})
+            continue
+        if not parser.messages:
+            issues.append({'file': filename, 'type': 'error', 'message': 'No messages parsed'})
+            continue
+
+        analyzer = parser.create_analyzer()
+        # Collect every pattern that fires exactly once in this file.
+        # Each one is a plausible candidate for the unknown target command.
+        patterns_exactly_one = analyzer.find_patterns_by_occurrence_count(1)
+        if not patterns_exactly_one:
+            issues.append({'file': filename, 'type': 'warning', 'message': 'No patterns occurring exactly once'})
+            continue
+
+        print(f"  {filename}: {len(patterns_exactly_one)} single-occurrence pattern(s)")
+        for pattern, msgs in patterns_exactly_one:
+            msg = msgs[0]
+            j1939 = msg.get_j1939_fields()
+            per_file_candidates.append(PerFileCandidate(
+                filename=filename, can_id=msg.can_id, data_signature=pattern,
+                timestamp=msg.timestamp, line_number=msg.line_number,
+                j1939_fields=j1939, occurrence_count=1
+            ))
+
+    # Group by (PGN, SA, DA) — the fields that must be identical across logs for
+    # the same command. Within each group, candidates from different files are
+    # cross-log matches; candidates from the same file are ignored for scoring.
+    grouped_by_key: Dict[Tuple, Dict[str, List[PerFileCandidate]]] = {}
+    for cand in per_file_candidates:
+        if not cand.j1939_fields:
+            continue
+        key = (
+            cand.j1939_fields.get('pgn', 0),
+            cand.j1939_fields.get('source_address', 0),
+            cand.j1939_fields.get('destination_address', 0),
+        )
+        grouped_by_key.setdefault(key, {}).setdefault(cand.filename, []).append(cand)
+
+    cross_log_matches: List[CrossLogMatch] = []
+    for key, by_file in grouped_by_key.items():
+        # Must appear in at least 2 different files
+        if len(by_file) < 2:
+            continue
+
+        pgn, sa, da = key
+
+        # Take one representative candidate per file (the only one, in normal use)
+        representative: List[PerFileCandidate] = [cands[0] for cands in by_file.values()]
+
+        similarity_score, payload_variance = compute_candidate_similarity(representative)
+        cross_log_matches.append(CrossLogMatch(
+            pgn=pgn, source_address=sa, destination_address=da,
+            candidates=representative,
+            similarity_score=similarity_score,
+            payload_variance=payload_variance,
+        ))
+
+    cross_log_matches.sort(key=lambda m: (-m.similarity_score, m.payload_variance))
+    return {
+        'per_file_candidates': per_file_candidates,
+        'cross_log_matches': cross_log_matches,
+        'issues': issues,
+        'files_processed': len(files),
+        'files_with_candidates': len(set(c.filename for c in per_file_candidates)),
+    }
+
+
+def print_multi_log_results(results: Dict[str, Any], config: Dict = None) -> None:
+    """Print human-readable multi-log analysis results."""
+    if config is None:
+        config = CONFIG
+    max_results = config.get('max_cross_log_results', 20)
+    print("\n" + "=" * 80)
+    print("MULTI-LOG ANALYSIS RESULTS")
+    print("=" * 80)
+    files_processed = results.get('files_processed', 0)
+    files_with_candidates = results.get('files_with_candidates', 0)
+    issues = results.get('issues', [])
+    print(f"\nSummary: Files processed: {files_processed}, Files with candidates: {files_with_candidates}, Issues: {len(issues)}")
+    if issues:
+        print("\nIssues:")
+        for issue in issues:
+            print(f"  [{issue['type'].upper()}] {issue['file']}: {issue['message']}")
+    cross_log_matches = results.get('cross_log_matches', [])
+    if not cross_log_matches:
+        print("\nNo cross-log matches found (need 2+ files with same PGN/SA/DA).")
+        return
+    cross_log_matches = cross_log_matches[:max_results]
+    print(f"\n{'=' * 80}\nCROSS-LOG MATCHES (ranked by similarity, showing top {len(cross_log_matches)})\n{'=' * 80}")
+    for rank, match in enumerate(cross_log_matches, 1):
+        print(f"\n--- Rank #{rank} ---")
+        print(f"  PGN: 0x{match.pgn:04X} ({match.pgn}), Source: 0x{match.source_address:02X}, Dest: 0x{match.destination_address:02X}")
+        print(f"  Similarity: {match.similarity_score:.4f}, Variance: {match.payload_variance:.2f}, Files: {len(match.candidates)}")
+        for cand in match.candidates:
+            payload_hex = cand.j1939_fields.get('payload_hex', cand.data_signature) if cand.j1939_fields else cand.data_signature
+            print(f"    {cand.filename}: CAN={cand.can_id}, Line={cand.line_number}, Payload={payload_hex}")
+    print(f"\n{'=' * 80}\nTOP RECOMMENDATION\n{'=' * 80}")
+    if cross_log_matches:
+        top = cross_log_matches[0]
+        print(f"PGN: 0x{top.pgn:04X}, Source: 0x{top.source_address:02X}, Dest: 0x{top.destination_address:02X}, Similarity: {top.similarity_score:.2%}, Found in {len(top.candidates)} logs")
+
+
+def find_multi_log_commands(config: Dict = None) -> Dict[str, Any]:
+    """Main entry point for multi-log analysis."""
+    if config is None:
+        config = CONFIG
+    paths = config.get('multi_log_paths')
+    if not paths:
+        print("Error: 'multi_log_paths' not configured in CONFIG")
+        return {'error': 'No paths configured'}
+    log_files = collect_log_files(paths)
+    if not log_files:
+        print(f"Error: No log files found in paths: {paths}")
+        return {'error': 'No log files found'}
+    print(f"Found {len(log_files)} log files:")
+    for f in log_files:
+        print(f"  - {os.path.basename(f)}")
+    results = analyze_multi_log(log_files, config)
+    print_multi_log_results(results, config)
+    return results
+
+
 def main():
-    """Main entry point - dispatches between absolute and offset-search modes."""
+    """Main entry point - dispatches between multi-log, offset-search, and absolute modes."""
     ts_fmt = CONFIG['timestamp_precision']
+
+    if CONFIG.get('multi_log_paths'):
+        find_multi_log_commands(CONFIG)
+        return
 
     if CONFIG.get('relative_fire_times'):
         candidates = find_offset_command_from_config(CONFIG)
