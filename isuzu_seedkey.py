@@ -127,7 +127,7 @@ def print_exchanges(frames: List[Frame]) -> None:
     key_sends   = [f for f in frames if is_key_send(f)]
     access_acks = [f for f in frames if is_access_granted(f)]
 
-    print(f"\nSecurity-access frames found:")
+    print("\nSecurity-access frames found:")
     print(f"  Seed requests  (27 01): {len(seed_reqs)}")
     print(f"  Seed responses (67 01): {len(seed_resps)}")
     print(f"  Key sends      (27 02): {len(key_sends)}")

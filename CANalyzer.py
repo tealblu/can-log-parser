@@ -4,7 +4,7 @@ import re
 import statistics
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict, Set, Any, Callable
+from typing import List, Optional, Tuple, Dict, Set, Any
 
 # ============================================================================
 # CONFIGURATION - Edit these settings to customize command detection
@@ -123,7 +123,7 @@ class CANMessage:
         if len(self.data_bytes) < 8:
             return None
         try:
-            payload_bytes = [int(b, 16) for b in self.data_bytes]
+            [int(b, 16) for b in self.data_bytes]
         except ValueError:
             return None
         can_id_int = int(self.can_id, 16) if isinstance(self.can_id, str) else self.can_id
@@ -509,7 +509,7 @@ class CANDataPatternAnalyzer:
         print(f"  Messages before filtering: {len(self.messages)}")
         print(f"  Messages after filtering: {len([m for m in self.messages if m.data_signature in valid_patterns])}")
         if valid_patterns:
-            print(f"  Sample valid data patterns:")
+            print("  Sample valid data patterns:")
             for i, pattern in enumerate(sorted(valid_patterns)[:5]):
                 print(f"    {i+1}: [{pattern}]")
             if len(valid_patterns) > 5:
@@ -974,7 +974,6 @@ class CANLogParser:
         if hasattr(fmt, 'reset'):
             fmt.reset()
 
-        skipped = 0
         parse_errors = 0
 
         try:
@@ -1034,7 +1033,7 @@ class CANLogParser:
             data_lengths[msg.data_length] = data_lengths.get(msg.data_length, 0) + 1
         print(f"Messages by data length: {dict(sorted(data_lengths.items()))}")
 
-        print(f"\nFirst few messages:")
+        print("\nFirst few messages:")
         for i, msg in enumerate(self.messages[:5]):
             data_str = ' '.join(msg.data_bytes)
             print(f"  {i+1}: CH{msg.channel} {msg.can_id} DL:{msg.data_length} [{data_str}] @ {msg.timestamp:.6f}")
@@ -1451,7 +1450,7 @@ def main():
         print_offset_candidates(candidates, CONFIG)
 
         if not candidates:
-            print(f"\nNo candidates found. Consider adjusting CONFIG parameters:")
+            print("\nNo candidates found. Consider adjusting CONFIG parameters:")
             print(f"  - 'search_radius' (currently {CONFIG['search_radius']}s)")
             print(f"  - 'min_coverage' (currently {CONFIG['min_coverage']:.0%})")
             print(f"  - 'relative_fire_times' (currently {CONFIG['relative_fire_times']})")
@@ -1465,7 +1464,7 @@ def main():
         print_command_candidates(candidates, CONFIG)
 
         if not candidates:
-            print(f"\nNo candidates found. Consider adjusting CONFIG parameters:")
+            print("\nNo candidates found. Consider adjusting CONFIG parameters:")
             print(f"  - 'search_radius' (currently {CONFIG['search_radius']}s)")
             print(f"  - 'min_coverage' (currently {CONFIG['min_coverage']:.0%})")
             print(f"  - 'command_fire_times' (currently {CONFIG['command_fire_times']})")
