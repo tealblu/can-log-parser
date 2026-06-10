@@ -16,7 +16,7 @@ CONFIG = {
 
     # Log file paths
     'log_directory': 'logs',
-    'log_filename': 'NULN3R32.LOG',
+    'log_filename': '',
     'full_log_path': lambda: f"{CONFIG['log_directory']}/{CONFIG['log_filename']}",
 
     # Log format - swap this to change which format is parsed
@@ -24,7 +24,7 @@ CONFIG = {
     'log_format': None,  # Set to None to auto-detect, or set explicitly
 
     # Multi-log analysis configuration
-    'multi_log_paths': None,   # List of log file paths or directory to scan
+    'multi_log_paths': ['logs'],   # List of log file paths or directory to scan
     'max_cross_log_results': 20,  # Maximum number of ranked matches to display
 
     # ---- Absolute mode -------------------------------------------------------
@@ -52,7 +52,29 @@ CONFIG = {
     'search_radius': 1,         # ± seconds around each fire time to search
     'min_coverage': 0.5,        # Minimum fraction of fire_times that must match (0.0-1.0)
     'max_candidates': 15,       # Maximum number of results to return
-    'expected_occurrence_count': None,  # Optional exact occurrence count filter for patterns
+    'expected_occurrence_count': 1,  # Optional exact occurrence count filter for patterns
+
+    # Source address filtering
+    # Messages whose J1939 source address (lowest byte of the 29-bit CAN ID)
+    # matches any value in this set are silently dropped during parsing.
+    # Add or remove hex values here to adjust the filter.
+    'skip_source_addresses': {},
+
+    # PGN filtering
+    # Messages whose J1939 PGN matches any value in this set are silently
+    # dropped during parsing.  PGN 0xEE00 (60928) is the Address Claimed /
+    # Cannot Claim Address message and is a common source of noise.
+    'skip_pgns': {
+        0xEE00,   # Address Claimed / Cannot Claim Address (background noise)
+        0xFF00,   # Proprietary A broadcast (Rank #1)
+        # 0xDA00 excluded: UDS/ISO 15765 needed for Security Access seed-key sniffing
+        0xFE00,   # Component Identification broadcasts (Ranks #8-12, #14)
+        0xE800,   # Acknowledgment messages (Ranks #13, #15, #16)
+        0xFD00,   # Status/data broadcast (Rank #17)
+        0xA400,   # Status/data broadcast (Rank #18)
+        0xA100,   # Status/data broadcast (Rank #19)
+        0xA000,   # Status/data broadcast (Rank #20)
+    },
 
     # Output formatting
     'print_log_summary': True,  # Print CAN log statistics before detection
@@ -108,15 +130,11 @@ class CANMessage:
         priority = (can_id_int >> 26) & 0x07
         pgn = (can_id_int >> 8) & 0x3FFFF
         source_address = can_id_int & 0xFF
-        
-        destination_address = 0xFF
+        pf = (can_id_int >> 16) & 0xFF
+        ps = (can_id_int >> 8) & 0xFF
+        destination_address = ps if pf < 240 else 0xFF
         payload = self.data_bytes
-        
-        if self.format_flag == 'J1939':
-            destination_address = payload_bytes[0] if len(payload_bytes) >= 1 else 0xFF
-        else:
-            destination_address = payload_bytes[0] if len(payload_bytes) >= 1 else 0xFF
-        
+
         return {
             'pgn': pgn,
             'source_address': source_address,
@@ -198,6 +216,30 @@ class LogFormat(ABC):
         """
         return False
 
+    @staticmethod
+    def skip_source_address(source_address: int) -> bool:
+        """
+        Return True if a message with the given J1939 source address should be
+        dropped.  The set of filtered addresses is read from
+        CONFIG['skip_source_addresses'] so callers only need to update CONFIG
+        to change filter behaviour.  Both KvaserLogFormat and NexiqLogFormat
+        delegate to this method after they have resolved the SA value.
+        """
+        return source_address in CONFIG.get('skip_source_addresses', set())
+
+    @staticmethod
+    def skip_pgn(pgn: int) -> bool:
+        """
+        Return True if a message with the given J1939 PGN should be dropped.
+        The set of filtered PGNs is read from CONFIG['skip_pgns'] so callers
+        only need to update CONFIG to change filter behaviour.  Both
+        KvaserLogFormat and NexiqLogFormat delegate to this method after they
+        have resolved the PGN value.
+
+        PGN is extracted from the 29-bit CAN ID as: (can_id_int >> 8) & 0x3FFFF
+        """
+        return pgn in CONFIG.get('skip_pgns', set())
+
     def parse_line(self, line: str, line_num: int) -> Optional[CANMessage]:
         """Parse one log line. Returns CANMessage or None."""
         line = line.strip()
@@ -255,6 +297,12 @@ class KvaserLogFormat(LogFormat):
             direction = match.group(7) or ''
 
             if len(data_bytes) != data_length:
+                return None
+
+            can_id_int = int(can_id, 16)
+            if self.skip_source_address(can_id_int & 0xFF):
+                return None
+            if self.skip_pgn((can_id_int >> 8) & 0x3FFFF):
                 return None
 
             return CANMessage(
@@ -353,6 +401,12 @@ class NexiqLogFormat(LogFormat):
             timestamp = float(ts_str)
 
             can_id = self._decode_can_id(raw_bytes)
+
+            if self.skip_source_address(raw_bytes[8]):
+                return None
+            if self.skip_pgn((raw_bytes[5] << 8) | raw_bytes[6]):
+                return None
+
             payload = raw_bytes[10:18]  # 8-byte J1939 data payload
             data_bytes = [f'{b:02X}' for b in payload]
             direction = direction_token.rstrip('()')  # "Rx" or "Tx"
@@ -928,16 +982,13 @@ class CANLogParser:
                 for line_num, line in enumerate(f, 1):
                     try:
                         message = fmt.parse_line(line, line_num)
+                        if message is not None:
+                            self.messages.append(message)
                     except Exception as exc:
                         parse_errors += 1
                         if parse_errors <= 5:
                             print(f"Warning: parse error on line {line_num}: {exc}")
                         continue
-
-                    if message:
-                        self.messages.append(message)
-                    else:
-                        skipped += 1
 
             print(f"[{fmt.name}] Parsed {len(self.messages)} messages from '{filename}'")
             if parse_errors:
