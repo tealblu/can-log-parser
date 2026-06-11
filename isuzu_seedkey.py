@@ -17,6 +17,14 @@ import re
 import sys
 from dataclasses import dataclass
 from typing import List, Optional
+from pathlib import Path
+from rich.console import Console
+from rich.progress import Progress
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+console = Console()
 
 # ── Log line parser ───────────────────────────────────────────────────────────
 # Handles both formats:
@@ -49,27 +57,32 @@ class Frame:
 
 def parse_frames(path: str) -> List[Frame]:
     frames = []
-    with open(path, 'r', errors='replace') as fh:
-        for line_no, raw in enumerate(fh, 1):
-            m = _LINE_RE.match(raw)
-            if not m:
-                continue
-            dlc = int(m.group(3))
-            byte_strs = m.group(4).split()
-            if len(byte_strs) != dlc:
-                continue
-            try:
-                data = [int(b, 16) for b in byte_strs]
-                frames.append(Frame(
-                    line_no=line_no,
-                    can_id=int(m.group(2), 16),
-                    dlc=dlc,
-                    data=data,
-                    timestamp=float(m.group(5)),
-                    raw=raw.rstrip(),
-                ))
-            except ValueError:
-                continue
+    file_lines = sum(1 for _ in open(path, 'r', errors='replace'))
+
+    with Progress() as progress:
+        task = progress.add_task("[cyan]Parsing log file...", total=file_lines)
+        with open(path, 'r', errors='replace') as fh:
+            for line_no, raw in enumerate(fh, 1):
+                progress.update(task, advance=1)
+                m = _LINE_RE.match(raw)
+                if not m:
+                    continue
+                dlc = int(m.group(3))
+                byte_strs = m.group(4).split()
+                if len(byte_strs) != dlc:
+                    continue
+                try:
+                    data = [int(b, 16) for b in byte_strs]
+                    frames.append(Frame(
+                        line_no=line_no,
+                        can_id=int(m.group(2), 16),
+                        dlc=dlc,
+                        data=data,
+                        timestamp=float(m.group(5)),
+                        raw=raw.rstrip(),
+                    ))
+                except ValueError:
+                    continue
     return frames
 
 
@@ -102,89 +115,113 @@ _KNOWN = {
 
 def _seed_label(hi: int, lo: int) -> str:
     pair = _KNOWN.get((hi, lo))
+    hex_val = f"[bold yellow]{hi:02X} {lo:02X}[/bold yellow]"
     if pair:
-        return f"{hi:02X} {lo:02X}  (known — expected key {pair[0]:02X} {pair[1]:02X})"
-    return f"{hi:02X} {lo:02X}  *** UNKNOWN SEED ***"
+        return f"{hex_val}  [dim](known — expected key {pair[0]:02X} {pair[1]:02X})[/dim]"
+    return f"{hex_val}  [bold red]UNKNOWN[/bold red]"
 
 def _key_label(hi: int, lo: int, seed_hi: Optional[int], seed_lo: Optional[int]) -> str:
+    hex_val = f"[bold cyan]{hi:02X} {lo:02X}[/bold cyan]"
     if seed_hi is not None:
         expected = _KNOWN.get((seed_hi, seed_lo))
         if expected:
-            match = "✓ correct" if (hi, lo) == expected else f"✗ wrong (expected {expected[0]:02X} {expected[1]:02X})"
-            return f"{hi:02X} {lo:02X}  {match}"
-    return f"{hi:02X} {lo:02X}"
+            if (hi, lo) == expected:
+                status = "[bold green]✓ CORRECT[/bold green]"
+            else:
+                status = f"[bold red]✗ WRONG[/bold red] [dim](expected {expected[0]:02X} {expected[1]:02X})[/dim]"
+            return f"{hex_val}  {status}"
+    return hex_val
 
 
 # ── Exchange assembly ─────────────────────────────────────────────────────────
-def _fmt(f: Frame, role: str) -> str:
-    data_str = ' '.join(f'{b:02X}' for b in f.data)
-    return (f"  {role:<16} line {f.line_no:>7}  ts={f.timestamp:>12.6f}  "
-            f"CAN={f.can_id:08X}  [{data_str}]")
-
 def print_exchanges(frames: List[Frame]) -> None:
     seed_reqs   = [f for f in frames if is_seed_request(f)]
     seed_resps  = [f for f in frames if is_seed_response(f)]
     key_sends   = [f for f in frames if is_key_send(f)]
     access_acks = [f for f in frames if is_access_granted(f)]
 
-    print("\nSecurity-access frames found:")
-    print(f"  Seed requests  (27 01): {len(seed_reqs)}")
-    print(f"  Seed responses (67 01): {len(seed_resps)}")
-    print(f"  Key sends      (27 02): {len(key_sends)}")
-    print(f"  Access granted (67 02): {len(access_acks)}")
+    summary_table = Table(title="Security-Access Frames Found", show_header=False, box=None)
+    summary_table.add_row("Seed requests  (27 01):", f"[cyan]{len(seed_reqs)}[/cyan]")
+    summary_table.add_row("Seed responses (67 01):", f"[cyan]{len(seed_resps)}[/cyan]")
+    summary_table.add_row("Key sends      (27 02):", f"[cyan]{len(key_sends)}[/cyan]")
+    summary_table.add_row("Access granted (67 02):", f"[cyan]{len(access_acks)}[/cyan]")
+    console.print(summary_table)
 
     if not seed_resps:
-        print("\nNo seed/key exchanges found in this log.")
+        console.print("\n[yellow]No seed/key exchanges found in this log.[/yellow]")
         return
 
-    # Pair each seed response with the closest following key send and access ack
+    console.print()
+
     def _next_after(pool: List[Frame], ts: float) -> Optional[Frame]:
         return next((f for f in pool if f.timestamp > ts), None)
 
-    print()
     for i, seed in enumerate(seed_resps, 1):
         seed_hi, seed_lo = seed.d(3), seed.d(4)
-        print(f"─── Exchange #{i} ─────────────────────────────────────────────────────")
-        req = _next_after(seed_reqs, seed.timestamp - 1.5)   # req comes just before seed
-        # find req that precedes this seed
         req = next((f for f in reversed(seed_reqs) if f.timestamp <= seed.timestamp), None)
         key = _next_after(key_sends, seed.timestamp)
         ack = _next_after(access_acks, seed.timestamp)
 
+        lines = []
+
         if req:
-            print(_fmt(req,  "seed request"))
-        print(_fmt(seed, "seed response"))
-        print(f"    seed value: {_seed_label(seed_hi, seed_lo)}")
+            data_str = ' '.join(f'{b:02X}' for b in req.data)
+            lines.append(f"[green]Seed Request[/green]  line {req.line_no}  ts={req.timestamp:.6f}  CAN={req.can_id:08X}")
+            lines.append(f"  [dim]{data_str}[/dim]")
+
+        data_str = ' '.join(f'{b:02X}' for b in seed.data)
+        lines.append(f"[magenta]Seed Response[/magenta]  line {seed.line_no}  ts={seed.timestamp:.6f}  CAN={seed.can_id:08X}")
+        lines.append(f"  [dim]{data_str}[/dim]")
+        seed_label = _seed_label(seed_hi, seed_lo)
+        lines.append(f"  [bold]Seed:[/bold] {seed_label}")
 
         if key:
             key_hi, key_lo = key.d(3), key.d(4)
-            print(_fmt(key, "key send"))
-            print(f"    key  value: {_key_label(key_hi, key_lo, seed_hi, seed_lo)}")
-            if req:
-                print(f"    seed→key lag: {(key.timestamp - seed.timestamp)*1000:.1f} ms")
+            data_str = ' '.join(f'{b:02X}' for b in key.data)
+            lines.append(f"[blue]Key Send[/blue]  line {key.line_no}  ts={key.timestamp:.6f}  CAN={key.can_id:08X}")
+            lines.append(f"  [dim]{data_str}[/dim]")
+            key_label = _key_label(key_hi, key_lo, seed_hi, seed_lo)
+            lines.append(f"  [bold]Key:[/bold] {key_label}")
+            lag_ms = (key.timestamp - seed.timestamp) * 1000
+            lines.append(f"  [dim]Seed→Key lag: {lag_ms:.1f} ms[/dim]")
         else:
-            print("  key send        (not found)")
+            lines.append("[yellow]Key Send[/yellow]  (not found)")
 
         if ack:
-            print(_fmt(ack, "access granted"))
+            data_str = ' '.join(f'{b:02X}' for b in ack.data)
+            lines.append(f"[green]Access Granted[/green]  line {ack.line_no}  ts={ack.timestamp:.6f}  CAN={ack.can_id:08X}")
+            lines.append(f"  [dim]{data_str}[/dim]")
             if key:
-                print(f"    key→ack  lag: {(ack.timestamp - key.timestamp)*1000:.1f} ms")
+                lag_ms = (ack.timestamp - key.timestamp) * 1000
+                lines.append(f"  [dim]Key→Ack lag: {lag_ms:.1f} ms[/dim]")
         else:
-            print("  access granted  (not found)")
+            lines.append("[yellow]Access Granted[/yellow]  (not found)")
 
-        print()
+        content = "\n".join(lines)
+        panel = Panel(content, title=f"Exchange #{i}")
+        console.print(panel)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
     if len(sys.argv) < 2:
-        print("Usage: python isuzu_seedkey.py <log_file>")
+        console.print("[red]Usage:[/red] python isuzu_seedkey.py <log_file>")
         sys.exit(1)
 
     path = sys.argv[1]
-    print(f"Parsing {path} ...")
+    if not Path(path).exists():
+        console.print(f"[red]Error:[/red] File not found: {path}")
+        sys.exit(1)
+
+    console.print(f"\n[bold]Parsing[/bold] {path} ...")
     frames = parse_frames(path)
-    print(f"Parsed {len(frames):,} frames total.")
+
+    summary = Panel(
+        f"[cyan]{len(frames):,}[/cyan] frames parsed",
+        title="[bold]Parse Complete[/bold]",
+        expand=False
+    )
+    console.print(summary)
     print_exchanges(frames)
 
 
