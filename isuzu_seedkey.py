@@ -16,11 +16,12 @@ Usage:
 import re
 import sys
 from dataclasses import dataclass
-from typing import Callable
 from pathlib import Path
+from typing import Callable
+
 from rich.console import Console
-from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn
 from rich.panel import Panel
+from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn
 from rich.table import Table
 
 # Ensure Unicode glyphs (✓ ✗ ● …) render even when output is piped on Windows.
@@ -38,13 +39,13 @@ console = Console()
 #   with flag:     CH  ID        FLAG  DLC  D0 ...  TS  DIR
 #   without flag:  CH  ID              DLC  D0 ...  TS  DIR
 _LINE_RE = re.compile(
-    r'^\s*(\d+)'                              # channel
-    + r'\s+([0-9A-Fa-f]+)'                   # CAN ID (hex)
-    + r'(?:\s+[A-Za-z]\w*)?'                 # optional flag token (letters-only start)
-    + r'\s+(\d+)'                            # DLC
-    + r'((?:\s+[0-9A-Fa-f]{1,2})+)'          # data bytes
-    + r'\s+([\d.]+)'                         # timestamp
-    + r'(?:\s+(\w+))?',                      # optional direction
+    r"^\s*(\d+)"  # channel
+    + r"\s+([0-9A-Fa-f]+)"  # CAN ID (hex)
+    + r"(?:\s+[A-Za-z]\w*)?"  # optional flag token (letters-only start)
+    + r"\s+(\d+)"  # DLC
+    + r"((?:\s+[0-9A-Fa-f]{1,2})+)"  # data bytes
+    + r"\s+([\d.]+)"  # timestamp
+    + r"(?:\s+(\w+))?",  # optional direction
     re.IGNORECASE,
 )
 
@@ -54,7 +55,7 @@ class Frame:
     line_no: int
     can_id: int
     dlc: int
-    data: list[int]       # raw byte values
+    data: list[int]  # raw byte values
     timestamp: float
     raw: str
 
@@ -64,9 +65,9 @@ class Frame:
 
 def parse_frames(path: str) -> list[Frame]:
     frames: list[Frame] = []
-    file_lines = sum(1 for _ in open(path, 'r', errors='replace'))
+    file_lines = sum(1 for _ in open(path, "r", errors="replace"))
 
-    # Bar without a time-remaining column (the estimate jumps around unhelpfully).
+    # Progress bar
     progress = Progress(
         TextColumn("[cyan]Parsing log file..."),
         BarColumn(),
@@ -74,7 +75,7 @@ def parse_frames(path: str) -> list[Frame]:
     )
     with progress:
         task = progress.add_task("parse", total=file_lines)
-        with open(path, 'r', errors='replace') as fh:
+        with open(path, "r", errors="replace") as fh:
             for line_no, raw in enumerate(fh, 1):
                 progress.update(task, advance=1)
                 m = _LINE_RE.match(raw)
@@ -86,34 +87,40 @@ def parse_frames(path: str) -> list[Frame]:
                     continue
                 try:
                     data = [int(b, 16) for b in byte_strs]
-                    frames.append(Frame(
-                        line_no=line_no,
-                        can_id=int(m.group(2), 16),
-                        dlc=dlc,
-                        data=data,
-                        timestamp=float(m.group(5)),
-                        raw=raw.rstrip(),
-                    ))
+                    frames.append(
+                        Frame(
+                            line_no=line_no,
+                            can_id=int(m.group(2), 16),
+                            dlc=dlc,
+                            data=data,
+                            timestamp=float(m.group(5)),
+                            raw=raw.rstrip(),
+                        )
+                    )
                 except ValueError:
                     continue
     return frames
 
 
 # ── Frame classifiers ─────────────────────────────────────────────────────────
-ECU_ID  = 0x7E8
+ECU_ID = 0x7E8
 TOOL_ID = 0x7E0
+
 
 def is_seed_request(f: Frame) -> bool:
     """Tester asks for seed: 7E0  02 27 01 ..."""
     return f.can_id == TOOL_ID and f.d(0) == 0x02 and f.d(1) == 0x27 and f.d(2) == 0x01
 
+
 def is_seed_response(f: Frame) -> bool:
     """ECU sends seed: 7E8  04 67 01 <hi> <lo> ..."""
     return f.can_id == ECU_ID and f.d(0) == 0x04 and f.d(1) == 0x67 and f.d(2) == 0x01
 
+
 def is_key_send(f: Frame) -> bool:
     """Tester sends key: 7E0  04 27 02 <hi> <lo> ..."""
     return f.can_id == TOOL_ID and f.d(0) == 0x04 and f.d(1) == 0x27 and f.d(2) == 0x02
+
 
 def is_access_granted(f: Frame) -> bool:
     """ECU confirms access: 7E8  02 67 02 ..."""
@@ -124,32 +131,42 @@ def is_access_granted(f: Frame) -> bool:
 # One function per semantic role. Each owns exactly one color/element, so the
 # palette is defined here once — never inline in the rendering code below.
 
-def success(text: object) -> str:   # green — a confirmed-good outcome
+
+def success(text: object) -> str:  # green — a confirmed-good outcome
     return f"[bold green]{text}[/bold green]"
 
-def failure(text: object) -> str:   # red — a genuine error / mismatch
+
+def failure(text: object) -> str:  # red — a genuine error / mismatch
     return f"[bold red]{text}[/bold red]"
 
-def warn(text: object) -> str:      # yellow — missing / unknown / unconfirmed
+
+def warn(text: object) -> str:  # yellow — missing / unknown / unconfirmed
     return f"[yellow]{text}[/yellow]"
 
-def info(text: object) -> str:      # cyan — neutral informational value
+
+def info(text: object) -> str:  # cyan — neutral informational value
     return f"[cyan]{text}[/cyan]"
 
-def muted(text: object) -> str:     # dim — secondary detail
+
+def muted(text: object) -> str:  # dim — secondary detail
     return f"[dim]{text}[/dim]"
 
-def label(text: object) -> str:     # bold — field name
+
+def label(text: object) -> str:  # bold — field name
     return f"[bold]{text}[/bold]"
 
-def value(text: object) -> str:     # bold white — a raw hex datum
+
+def value(text: object) -> str:  # bold white — a raw hex datum
     return f"[bold white]{text}[/bold white]"
 
+
 def hex_bytes(data: list[int]) -> str:
-    return ' '.join(f'{b:02X}' for b in data)
+    return " ".join(f"{b:02X}" for b in data)
+
 
 def hex_pair(hi: int, lo: int) -> str:
     return f"{hi:02X} {lo:02X}"
+
 
 # Status dots — one element, colored by the helper that owns each role.
 DOT = "●"
@@ -162,12 +179,14 @@ _KNOWN = {
     (0xD5, 0x9A): (0x6A, 0x3C),
 }
 
+
 def _seed_label(hi: int, lo: int) -> str:
     pair = _KNOWN.get((hi, lo))
     hex_val = value(hex_pair(hi, lo))
     if pair:
         return f"{hex_val}  {info(f'(known — expected key {hex_pair(*pair)})')}"
     return f"{hex_val}  {warn('⚠ unrecognized seed')}"
+
 
 def _key_label(hi: int, lo: int, seed_hi: int | None, seed_lo: int | None) -> str:
     hex_val = value(hex_pair(hi, lo))
@@ -177,19 +196,23 @@ def _key_label(hi: int, lo: int, seed_hi: int | None, seed_lo: int | None) -> st
             if (hi, lo) == expected:
                 status = success("✓ CORRECT")
             else:
-                status = f"{failure('✗ WRONG')} {muted(f'(expected {hex_pair(*expected)})')}"
+                status = (
+                    f"{failure('✗ WRONG')} {muted(f'(expected {hex_pair(*expected)})')}"
+                )
             return f"{hex_val}  {status}"
     return hex_val
 
 
 # ── Exchange assembly ─────────────────────────────────────────────────────────
 def print_exchanges(frames: list[Frame]) -> None:
-    seed_reqs   = [f for f in frames if is_seed_request(f)]
-    seed_resps  = [f for f in frames if is_seed_response(f)]
-    key_sends   = [f for f in frames if is_key_send(f)]
+    seed_reqs = [f for f in frames if is_seed_request(f)]
+    seed_resps = [f for f in frames if is_seed_response(f)]
+    key_sends = [f for f in frames if is_key_send(f)]
     access_acks = [f for f in frames if is_access_granted(f)]
 
-    summary_table = Table(title="Security-Access Frames Found", show_header=False, box=None)
+    summary_table = Table(
+        title="Security-Access Frames Found", show_header=False, box=None
+    )
     summary_table.add_row("Seed requests  (27 01):", info(len(seed_reqs)))
     summary_table.add_row("Seed responses (67 01):", info(len(seed_resps)))
     summary_table.add_row("Key sends      (27 02):", info(len(key_sends)))
@@ -207,16 +230,22 @@ def print_exchanges(frames: list[Frame]) -> None:
 
     for i, seed in enumerate(seed_resps, 1):
         seed_hi, seed_lo = seed.d(3), seed.d(4)
-        req = next((f for f in reversed(seed_reqs) if f.timestamp <= seed.timestamp), None)
+        req = next(
+            (f for f in reversed(seed_reqs) if f.timestamp <= seed.timestamp), None
+        )
         key = _next_after(key_sends, seed.timestamp)
         ack = _next_after(access_acks, seed.timestamp)
 
         lines: list[str] = []
 
-        def present_frame(name: str, f: Frame, *, dot: Callable[[object], str] = info) -> None:
+        def present_frame(
+            name: str, f: Frame, *, dot: Callable[[object], str] = info
+        ) -> None:
             """Render a frame that was found: colored dot + header + its raw bytes."""
-            lines.append(f"{dot(DOT)} {label(name)}  "
-                         + muted(f"line {f.line_no}  ts={f.timestamp:.6f}  CAN={f.can_id:08X}"))
+            lines.append(
+                f"{dot(DOT)} {label(name)}  "
+                + muted(f"line {f.line_no}  ts={f.timestamp:.6f}  CAN={f.can_id:08X}")
+            )
             lines.append("  " + muted(hex_bytes(f.data)))
 
         def missing_frame(name: str, note: str) -> None:
@@ -240,7 +269,11 @@ def print_exchanges(frames: list[Frame]) -> None:
         if key:
             key_hi, key_lo = key.d(3), key.d(4)
             present_frame("Key Send", key)
-            lines.append("  " + label("Key:") + f"  {_key_label(key_hi, key_lo, seed_hi, seed_lo)}")
+            lines.append(
+                "  "
+                + label("Key:")
+                + f"  {_key_label(key_hi, key_lo, seed_hi, seed_lo)}"
+            )
             detail(f"Seed→Key lag: {(key.timestamp - seed.timestamp) * 1000:.1f} ms")
         else:
             missing_frame("Key Send", "not found")
@@ -260,7 +293,9 @@ def print_exchanges(frames: list[Frame]) -> None:
         else:
             border, title_tag = "yellow", warn("…")
 
-        panel = Panel("\n".join(lines), title=f"{title_tag} Exchange #{i}", border_style=border)
+        panel = Panel(
+            "\n".join(lines), title=f"{title_tag} Exchange #{i}", border_style=border
+        )
         console.print(panel)
 
 
@@ -281,7 +316,7 @@ def main() -> None:
     summary = Panel(
         f"{info(f'{len(frames):,}')} frames parsed",
         title=label("Parse Complete"),
-        expand=False
+        expand=False,
     )
     console.print(summary)
     print_exchanges(frames)
