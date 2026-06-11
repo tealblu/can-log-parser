@@ -19,10 +19,16 @@ from dataclasses import dataclass
 from typing import List, Optional
 from pathlib import Path
 from rich.console import Console
-from rich.progress import Progress
+from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
+
+# Ensure Unicode glyphs (✓ ✗ ● …) render even when output is piped on Windows.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 console = Console()
 
@@ -59,8 +65,14 @@ def parse_frames(path: str) -> List[Frame]:
     frames = []
     file_lines = sum(1 for _ in open(path, 'r', errors='replace'))
 
-    with Progress() as progress:
-        task = progress.add_task("[cyan]Parsing log file...", total=file_lines)
+    # Bar without a time-remaining column (the estimate jumps around unhelpfully).
+    progress = Progress(
+        TextColumn("[cyan]Parsing log file..."),
+        BarColumn(),
+        TaskProgressColumn(),
+    )
+    with progress:
+        task = progress.add_task("parse", total=file_lines)
         with open(path, 'r', errors='replace') as fh:
             for line_no, raw in enumerate(fh, 1):
                 progress.update(task, advance=1)
@@ -107,6 +119,42 @@ def is_access_granted(f: Frame) -> bool:
     return f.can_id == ECU_ID and f.d(0) == 0x02 and f.d(1) == 0x67 and f.d(2) == 0x02
 
 
+# ── Styling primitives ────────────────────────────────────────────────────────
+# One function per semantic role. Each owns exactly one color/element, so the
+# palette is defined here once — never inline in the rendering code below.
+
+def success(text: str) -> str:      # green — a confirmed-good outcome
+    return f"[bold green]{text}[/bold green]"
+
+def failure(text: str) -> str:      # red — a genuine error / mismatch
+    return f"[bold red]{text}[/bold red]"
+
+def warn(text: str) -> str:         # yellow — missing / unknown / unconfirmed
+    return f"[yellow]{text}[/yellow]"
+
+def info(text: str) -> str:         # cyan — neutral informational value
+    return f"[cyan]{text}[/cyan]"
+
+def muted(text: str) -> str:        # dim — secondary detail
+    return f"[dim]{text}[/dim]"
+
+def label(text: str) -> str:        # bold — field name
+    return f"[bold]{text}[/bold]"
+
+def value(text: str) -> str:        # bold white — a raw hex datum
+    return f"[bold white]{text}[/bold white]"
+
+def hex_bytes(data: List[int]) -> str:
+    return ' '.join(f'{b:02X}' for b in data)
+
+def hex_pair(hi: int, lo: int) -> str:
+    return f"{hi:02X} {lo:02X}"
+
+# Status dots — one element, colored by the helper that owns each role.
+DOT = "●"
+MISSING_DOT = "○"
+
+
 # ── Known seed/key pairs (from IsuzuKWP_MessageTranslations.cs) ───────────────
 _KNOWN = {
     (0x83, 0x40): (0x97, 0x65),
@@ -115,20 +163,20 @@ _KNOWN = {
 
 def _seed_label(hi: int, lo: int) -> str:
     pair = _KNOWN.get((hi, lo))
-    hex_val = f"[bold yellow]{hi:02X} {lo:02X}[/bold yellow]"
+    hex_val = value(hex_pair(hi, lo))
     if pair:
-        return f"{hex_val}  [dim](known — expected key {pair[0]:02X} {pair[1]:02X})[/dim]"
-    return f"{hex_val}  [bold red]UNKNOWN[/bold red]"
+        return f"{hex_val}  {info(f'(known — expected key {hex_pair(*pair)})')}"
+    return f"{hex_val}  {warn('⚠ unrecognized seed')}"
 
 def _key_label(hi: int, lo: int, seed_hi: Optional[int], seed_lo: Optional[int]) -> str:
-    hex_val = f"[bold cyan]{hi:02X} {lo:02X}[/bold cyan]"
+    hex_val = value(hex_pair(hi, lo))
     if seed_hi is not None:
         expected = _KNOWN.get((seed_hi, seed_lo))
         if expected:
             if (hi, lo) == expected:
-                status = "[bold green]✓ CORRECT[/bold green]"
+                status = success("✓ CORRECT")
             else:
-                status = f"[bold red]✗ WRONG[/bold red] [dim](expected {expected[0]:02X} {expected[1]:02X})[/dim]"
+                status = f"{failure('✗ WRONG')} {muted(f'(expected {hex_pair(*expected)})')}"
             return f"{hex_val}  {status}"
     return hex_val
 
@@ -141,14 +189,14 @@ def print_exchanges(frames: List[Frame]) -> None:
     access_acks = [f for f in frames if is_access_granted(f)]
 
     summary_table = Table(title="Security-Access Frames Found", show_header=False, box=None)
-    summary_table.add_row("Seed requests  (27 01):", f"[cyan]{len(seed_reqs)}[/cyan]")
-    summary_table.add_row("Seed responses (67 01):", f"[cyan]{len(seed_resps)}[/cyan]")
-    summary_table.add_row("Key sends      (27 02):", f"[cyan]{len(key_sends)}[/cyan]")
-    summary_table.add_row("Access granted (67 02):", f"[cyan]{len(access_acks)}[/cyan]")
+    summary_table.add_row("Seed requests  (27 01):", info(len(seed_reqs)))
+    summary_table.add_row("Seed responses (67 01):", info(len(seed_resps)))
+    summary_table.add_row("Key sends      (27 02):", info(len(key_sends)))
+    summary_table.add_row("Access granted (67 02):", info(len(access_acks)))
     console.print(summary_table)
 
     if not seed_resps:
-        console.print("\n[yellow]No seed/key exchanges found in this log.[/yellow]")
+        console.print("\n" + warn("No seed/key exchanges found in this log."))
         return
 
     console.print()
@@ -164,61 +212,74 @@ def print_exchanges(frames: List[Frame]) -> None:
 
         lines = []
 
+        def present_frame(name: str, f: Frame, *, dot=info) -> None:
+            """Render a frame that was found: colored dot + header + its raw bytes."""
+            lines.append(f"{dot(DOT)} {label(name)}  "
+                         + muted(f"line {f.line_no}  ts={f.timestamp:.6f}  CAN={f.can_id:08X}"))
+            lines.append("  " + muted(hex_bytes(f.data)))
+
+        def missing_frame(name: str, note: str) -> None:
+            """Render a frame that was expected but not found."""
+            lines.append(f"{warn(MISSING_DOT)} {warn(name)}  {warn(f'({note})')}")
+
+        def detail(text: str) -> None:
+            lines.append("  " + muted(text))
+
+        # 1 — Seed request (tester → ECU). Informational step.
         if req:
-            data_str = ' '.join(f'{b:02X}' for b in req.data)
-            lines.append(f"[green]Seed Request[/green]  line {req.line_no}  ts={req.timestamp:.6f}  CAN={req.can_id:08X}")
-            lines.append(f"  [dim]{data_str}[/dim]")
+            present_frame("Seed Request", req)
+        else:
+            missing_frame("Seed Request", "not found")
 
-        data_str = ' '.join(f'{b:02X}' for b in seed.data)
-        lines.append(f"[magenta]Seed Response[/magenta]  line {seed.line_no}  ts={seed.timestamp:.6f}  CAN={seed.can_id:08X}")
-        lines.append(f"  [dim]{data_str}[/dim]")
-        seed_label = _seed_label(seed_hi, seed_lo)
-        lines.append(f"  [bold]Seed:[/bold] {seed_label}")
+        # 2 — Seed response (ECU → tester). Informational step.
+        present_frame("Seed Response", seed)
+        lines.append("  " + label("Seed:") + f" {_seed_label(seed_hi, seed_lo)}")
 
+        # 3 — Key send (tester → ECU). Informational step.
         if key:
             key_hi, key_lo = key.d(3), key.d(4)
-            data_str = ' '.join(f'{b:02X}' for b in key.data)
-            lines.append(f"[blue]Key Send[/blue]  line {key.line_no}  ts={key.timestamp:.6f}  CAN={key.can_id:08X}")
-            lines.append(f"  [dim]{data_str}[/dim]")
-            key_label = _key_label(key_hi, key_lo, seed_hi, seed_lo)
-            lines.append(f"  [bold]Key:[/bold] {key_label}")
-            lag_ms = (key.timestamp - seed.timestamp) * 1000
-            lines.append(f"  [dim]Seed→Key lag: {lag_ms:.1f} ms[/dim]")
+            present_frame("Key Send", key)
+            lines.append("  " + label("Key:") + f"  {_key_label(key_hi, key_lo, seed_hi, seed_lo)}")
+            detail(f"Seed→Key lag: {(key.timestamp - seed.timestamp) * 1000:.1f} ms")
         else:
-            lines.append("[yellow]Key Send[/yellow]  (not found)")
+            missing_frame("Key Send", "not found")
 
+        # 4 — Access granted (ECU → tester). The actual outcome: success.
         if ack:
-            data_str = ' '.join(f'{b:02X}' for b in ack.data)
-            lines.append(f"[green]Access Granted[/green]  line {ack.line_no}  ts={ack.timestamp:.6f}  CAN={ack.can_id:08X}")
-            lines.append(f"  [dim]{data_str}[/dim]")
+            present_frame("Access Granted", ack, dot=success)
+            lines.append("  " + success("✓ SECURITY ACCESS GRANTED"))
             if key:
-                lag_ms = (ack.timestamp - key.timestamp) * 1000
-                lines.append(f"  [dim]Key→Ack lag: {lag_ms:.1f} ms[/dim]")
+                detail(f"Key→Ack lag: {(ack.timestamp - key.timestamp) * 1000:.1f} ms")
         else:
-            lines.append("[yellow]Access Granted[/yellow]  (not found)")
+            missing_frame("Access Granted", "not found — access not confirmed")
 
-        content = "\n".join(lines)
-        panel = Panel(content, title=f"Exchange #{i}")
+        # Panel border + title marker reflect the exchange outcome.
+        if ack:
+            border, title_tag = "green", success("✓")
+        else:
+            border, title_tag = "yellow", warn("…")
+
+        panel = Panel("\n".join(lines), title=f"{title_tag} Exchange #{i}", border_style=border)
         console.print(panel)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main() -> None:
     if len(sys.argv) < 2:
-        console.print("[red]Usage:[/red] python isuzu_seedkey.py <log_file>")
+        console.print(f"{failure('Usage:')} python isuzu_seedkey.py <log_file>")
         sys.exit(1)
 
     path = sys.argv[1]
     if not Path(path).exists():
-        console.print(f"[red]Error:[/red] File not found: {path}")
+        console.print(f"{failure('Error:')} File not found: {path}")
         sys.exit(1)
 
-    console.print(f"\n[bold]Parsing[/bold] {path} ...")
+    console.print(f"\n{label('Parsing')} {path} ...")
     frames = parse_frames(path)
 
     summary = Panel(
-        f"[cyan]{len(frames):,}[/cyan] frames parsed",
-        title="[bold]Parse Complete[/bold]",
+        f"{info(f'{len(frames):,}')} frames parsed",
+        title=label("Parse Complete"),
         expand=False
     )
     console.print(summary)
