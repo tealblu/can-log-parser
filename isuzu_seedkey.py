@@ -16,7 +16,7 @@ Usage:
 import re
 import sys
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable
 from pathlib import Path
 from rich.console import Console
 from rich.progress import BarColumn, Progress, TaskProgressColumn, TextColumn
@@ -24,9 +24,10 @@ from rich.panel import Panel
 from rich.table import Table
 
 # Ensure Unicode glyphs (✓ ✗ ● …) render even when output is piped on Windows.
-if hasattr(sys.stdout, "reconfigure"):
+_reconfigure = getattr(sys.stdout, "reconfigure", None)
+if callable(_reconfigure):
     try:
-        sys.stdout.reconfigure(encoding="utf-8")
+        _ = _reconfigure(encoding="utf-8")
     except Exception:
         pass
 
@@ -38,12 +39,12 @@ console = Console()
 #   without flag:  CH  ID              DLC  D0 ...  TS  DIR
 _LINE_RE = re.compile(
     r'^\s*(\d+)'                              # channel
-    r'\s+([0-9A-Fa-f]+)'                     # CAN ID (hex)
-    r'(?:\s+[A-Za-z]\w*)?'                   # optional flag token (letters-only start)
-    r'\s+(\d+)'                               # DLC
-    r'((?:\s+[0-9A-Fa-f]{1,2})+)'           # data bytes
-    r'\s+([\d.]+)'                            # timestamp
-    r'(?:\s+(\w+))?',                         # optional direction
+    + r'\s+([0-9A-Fa-f]+)'                   # CAN ID (hex)
+    + r'(?:\s+[A-Za-z]\w*)?'                 # optional flag token (letters-only start)
+    + r'\s+(\d+)'                            # DLC
+    + r'((?:\s+[0-9A-Fa-f]{1,2})+)'          # data bytes
+    + r'\s+([\d.]+)'                         # timestamp
+    + r'(?:\s+(\w+))?',                      # optional direction
     re.IGNORECASE,
 )
 
@@ -53,7 +54,7 @@ class Frame:
     line_no: int
     can_id: int
     dlc: int
-    data: List[int]       # raw byte values
+    data: list[int]       # raw byte values
     timestamp: float
     raw: str
 
@@ -61,8 +62,8 @@ class Frame:
         return self.data[idx] if idx < len(self.data) else -1
 
 
-def parse_frames(path: str) -> List[Frame]:
-    frames = []
+def parse_frames(path: str) -> list[Frame]:
+    frames: list[Frame] = []
     file_lines = sum(1 for _ in open(path, 'r', errors='replace'))
 
     # Bar without a time-remaining column (the estimate jumps around unhelpfully).
@@ -123,28 +124,28 @@ def is_access_granted(f: Frame) -> bool:
 # One function per semantic role. Each owns exactly one color/element, so the
 # palette is defined here once — never inline in the rendering code below.
 
-def success(text: str) -> str:      # green — a confirmed-good outcome
+def success(text: object) -> str:   # green — a confirmed-good outcome
     return f"[bold green]{text}[/bold green]"
 
-def failure(text: str) -> str:      # red — a genuine error / mismatch
+def failure(text: object) -> str:   # red — a genuine error / mismatch
     return f"[bold red]{text}[/bold red]"
 
-def warn(text: str) -> str:         # yellow — missing / unknown / unconfirmed
+def warn(text: object) -> str:      # yellow — missing / unknown / unconfirmed
     return f"[yellow]{text}[/yellow]"
 
-def info(text: str) -> str:         # cyan — neutral informational value
+def info(text: object) -> str:      # cyan — neutral informational value
     return f"[cyan]{text}[/cyan]"
 
-def muted(text: str) -> str:        # dim — secondary detail
+def muted(text: object) -> str:     # dim — secondary detail
     return f"[dim]{text}[/dim]"
 
-def label(text: str) -> str:        # bold — field name
+def label(text: object) -> str:     # bold — field name
     return f"[bold]{text}[/bold]"
 
-def value(text: str) -> str:        # bold white — a raw hex datum
+def value(text: object) -> str:     # bold white — a raw hex datum
     return f"[bold white]{text}[/bold white]"
 
-def hex_bytes(data: List[int]) -> str:
+def hex_bytes(data: list[int]) -> str:
     return ' '.join(f'{b:02X}' for b in data)
 
 def hex_pair(hi: int, lo: int) -> str:
@@ -168,9 +169,9 @@ def _seed_label(hi: int, lo: int) -> str:
         return f"{hex_val}  {info(f'(known — expected key {hex_pair(*pair)})')}"
     return f"{hex_val}  {warn('⚠ unrecognized seed')}"
 
-def _key_label(hi: int, lo: int, seed_hi: Optional[int], seed_lo: Optional[int]) -> str:
+def _key_label(hi: int, lo: int, seed_hi: int | None, seed_lo: int | None) -> str:
     hex_val = value(hex_pair(hi, lo))
-    if seed_hi is not None:
+    if seed_hi is not None and seed_lo is not None:
         expected = _KNOWN.get((seed_hi, seed_lo))
         if expected:
             if (hi, lo) == expected:
@@ -182,7 +183,7 @@ def _key_label(hi: int, lo: int, seed_hi: Optional[int], seed_lo: Optional[int])
 
 
 # ── Exchange assembly ─────────────────────────────────────────────────────────
-def print_exchanges(frames: List[Frame]) -> None:
+def print_exchanges(frames: list[Frame]) -> None:
     seed_reqs   = [f for f in frames if is_seed_request(f)]
     seed_resps  = [f for f in frames if is_seed_response(f)]
     key_sends   = [f for f in frames if is_key_send(f)]
@@ -201,7 +202,7 @@ def print_exchanges(frames: List[Frame]) -> None:
 
     console.print()
 
-    def _next_after(pool: List[Frame], ts: float) -> Optional[Frame]:
+    def _next_after(pool: list[Frame], ts: float) -> Frame | None:
         return next((f for f in pool if f.timestamp > ts), None)
 
     for i, seed in enumerate(seed_resps, 1):
@@ -210,9 +211,9 @@ def print_exchanges(frames: List[Frame]) -> None:
         key = _next_after(key_sends, seed.timestamp)
         ack = _next_after(access_acks, seed.timestamp)
 
-        lines = []
+        lines: list[str] = []
 
-        def present_frame(name: str, f: Frame, *, dot=info) -> None:
+        def present_frame(name: str, f: Frame, *, dot: Callable[[object], str] = info) -> None:
             """Render a frame that was found: colored dot + header + its raw bytes."""
             lines.append(f"{dot(DOT)} {label(name)}  "
                          + muted(f"line {f.line_no}  ts={f.timestamp:.6f}  CAN={f.can_id:08X}"))
