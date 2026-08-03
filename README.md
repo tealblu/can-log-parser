@@ -59,3 +59,8 @@ python CANalyzer.py
 
 - Log files and `__pycache__` are git-ignored.
 - `pyrightconfig.json` configures type checking.
+
+## License
+
+BSD 2-Clause — see [LICENSE](LICENSE). Free to use, modify, and redistribute;
+just keep the copyright notice (© 2026 Indigo Hartsell).
